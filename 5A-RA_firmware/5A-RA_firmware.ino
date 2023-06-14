@@ -1,9 +1,12 @@
 /* 
   Created by Valentin Betbeze
-  03 Nov. 2022
-  Description:  Firmware of the 5-Axis Robotic Arm.
-
- */
+  Date: 03 Nov. 2022
+  Description:  Control firmware of my custom 5-Axis Robotic Arm.
+                Includes single motor control (manual mode) as well
+                as cartesian control of the effector.
+  
+  Note: Will need to be modified if to be used on a different machine.
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +40,7 @@
  See https://reference.arduino.cc/reference/en/libraries/servo/attach/
  These values have been determined empirically, and are unique to each
  motor.
- */
+*/
 #define M1_PW_MIN       410
 #define M1_PW_MAX       2370
 #define M2_PW_MIN       500
@@ -47,7 +50,7 @@
 #define M3_PW_MIN       400
 #define M3_PW_MAX       2330
 #define M4_PW_MIN       380
-#define M4_PW_MAX       2300
+#define M4_PW_MAX       2430
 #define M5_PW_MIN       544
 #define M5_PW_MAX       2500
 
@@ -71,37 +74,43 @@
 #define ANGLE_INIT_UA   30        // Upper Arm initial angle, in degree
 #define INVR_TRANS_LA   1.65      // Lower Arm transmission inverse ratio
 #define INVR_TRANS_UA   2         // Upper Arm transmission inverse ratio
-#define HEIGHT_SHOULDER 136       // Shoulder's axis height (ref: ground), in mm
+#define HEIGHT_SHOULDER 151       // Shoulder's axis height (ref: ground), in mm
 #define LENGTH_LA       150       // Lower Arm length, in mm
 #define M3M4            25.56     // Interaxial distance between the axis of M3 and M4, in mm
 #define LENGTH_UA       186.76    // Upper Arm length, in mm
-#define LENGTH_WRIST    35        // Wrist length, in mm
+#define LENGTH_WRIST    43        // Wrist length, in mm
 
-// Robot dynamic parameters
-#define ACC             160       // acceleration in deg/s²
-#define TF              3000      // full duration of a displacement in ms
+// Speeds
+#define LOW_SPEED       45        // in mm/s
+#define HIGH_SPEED      90        // in mm/s
+#define SMM_TRAJ_DUR    3000      // Single motor mode trajectory duration, in ms
 
 
 /*------------ DATA STRUCTURES ------------*/
 typedef struct {
+  int16_t x;          // mm
+  int16_t y;          // mm
+  int16_t z;          // mm
+  int16_t yaw;        // deg
+  int16_t pitch;      // deg
+  // roll not available on current robot version
+} cartesian_coord_t;
+
+// Linear segment between 2 cartesian coordinates locations.
+typedef struct {
+  cartesian_coord_t coord;
+  uint16_t avg_speed; // in mm/s
+  int duration;   // in ms
+} trajectory_t;
+
+typedef struct {
   uint8_t forward;
   int64_t t1;
-  int64_t t2;
   uint8_t angle_t0;
   uint8_t angle_t1;
-  uint8_t angle_t2;
   uint8_t angle_tf;
-  int32_t delta;
-}  motor_dynamics_t ;
-
-typedef struct  {
-  int16_t x;      // mm
-  int16_t y;      // mm
-  int16_t z;      // mm
-  int16_t yaw;    // deg
-  int16_t pitch;  // deg
-  // roll not available on current robot version
-} cartesian_position_t;
+  uint16_t acc;
+} motor_dynamics_t;
 
 
 /*----------- GLOBAL VARIABLES ------------*/
@@ -118,52 +127,111 @@ motor_dynamics_t dynamics_M3;
 motor_dynamics_t dynamics_M4;
 motor_dynamics_t dynamics_M5;
 
-cartesian_position_t cartesian_pos;
+/* Effector dependent! Update with new effector length or make script to take
+ LENGTH_WRIST into consideration
+ */
+#define INITIAL_COORD   {.x = 10, .y = 0, .z = 282, .yaw = 0, .pitch = 0}
+cartesian_coord_t current_coord;
 
 uint8_t motor_id = 0;
 bool single_motor_mode    = false;
 bool cartesian_mode       = false;
 bool single_motor_running = false;
-bool five_axis_running    = false;
 
 
 /*---------- FUNCTION PROTOTYPES ----------*/
-/* @brief Parse an input for cartesian coordinate control of the effector.
- Parameters:
- Return 1 if errors are encountered, else 0.
- */
-static uint8_t parse_cartesian_input(cartesian_position_t *pos, const char *input, const size_t len);
+/* 
+  Description: Initialise the servo motor angular position. Use only in setup().
 
-/* Initialise the servo motor angular position. Use only in setup().
- */
+*/
 static void initialise_robot(void);
 
-/* Provides the motor angles in degree required to reach the cartesian 
- position given as input. The function directly updates the angles for 
- each motor in their respective struct <motor_dynamics_t> (angle_tf).
- */
-static void get_angles_from_cartesian(cartesian_position_t *pos);
+/* 
+  Description: Parse a cartesian coordinate user input and loads it in memory.
 
-/* Computation of the required motor_dynamics_t parameters for a 
- given distance with regards to desired effector speed and acceleration.
- @warning: The final angle `stopAngle` must be determined and assigned to
- the motor_dynamics_t variable prior to using the function.
- */
-static void compute_dynamics(motor_dynamics_t *dyn, const uint8_t current_angle);
-
-/* Computes the angle at a time t between t0 and tf so that the motor 
-accelerates and decelerates while heading to stopAngle.
+  Parameters:
+    input - Input string
+    len - Size of the string
+    coord - Pointer to memory location on where to load the parsed coordinates.
+  Return:
+    1 if errors are encountered, else 0.
 */
-static uint8_t compute_angle(const motor_dynamics_t *dyn, const int64_t t);
+static uint8_t parse_cartesian_input(const char input[], const size_t len, cartesian_coord_t *coord);
 
-/* Resets the robot to its idle configuration
- */
-static uint8_t reset_robot(void);
+/* 
+  Description: Provide the motor angles in degree required to reach the cartesian 
+              position given as input. The function directly updates the angles for 
+              each motor in their respective struct <motor_dynamics_t> (angle_tf).
 
-/* Determines if the delta of the polynomial equation is >= 0,
- meaning the given position is within the work enveloppe.
- */
-static uint8_t is_delta_positive(void);
+  Parameters:
+    coord - Pointer to the cartesian coordinates.
+  Return:
+    1 if the coordinates are beyond the work enveloppe, else O.
+*/
+static uint8_t get_angles_from_cartesian(const cartesian_coord_t *coord);
+
+/* 
+  Description: Compute the total duration of a trajectory, in ms.
+
+  Parameters:
+    traj - Pointer to the trajectory data.
+  Return:
+    1 if errors are encountered, else 0.
+*/
+static uint8_t compute_trajectory_duration(trajectory_t *traj);
+
+/* 
+  Description: Compute the dynamics parameters of a motor for a specific
+              distance. The smallest possible acceleration is taken, so as to
+              have the smoothest effector displacements.
+
+  Parameters:
+    duration - Duration of the displacement.
+    current_angle - Current motor angle (use motor.read()).
+    dyn - Pointer to the dynamics data of the motor.
+
+  Warning: The final angle `stopAngle` must be determined and assigned to
+          the motor_dynamics_t variable prior to using the function.
+*/
+static void compute_motor_dynamics(const int duration, const int current_angle, motor_dynamics_t *dyn);
+
+/* 
+  Description: Compute the motor angle to feed to a motor at a given time 
+              between the beginning and the end of its course. This function 
+              allows the motor to accelerate and deccelerate in a controlled way.
+
+  Parameters:
+    dyn - Pointer to the dynamics data of the motor.
+    duration - Duration of the displacement.
+    t - The current time at which to compute the new angle.
+  Return:
+    The new angle to feed to the motor.
+*/
+
+static uint8_t compute_angle(const motor_dynamics_t *dyn, const int duration, const int64_t t);
+
+/*
+  Description: Operate the robot along the given trajectory. This functions
+                makes use of most of the previous functions to compute all
+                required physical parameters.
+  
+  Parameters:
+    traj - Pointer to the trajectory data. 
+*/
+static void run_robot(const trajectory_t *traj);
+
+/*
+  Description: Reset the robot to its idle position.
+
+*/
+static void reset_robot(void);
+
+/*
+  Description: Operate the robot along a sequence of trajectories. A delay
+  can be added in between each trajectory.
+
+*/
+static void follow_path(trajectory_t path[], const uint32_t npoints, const uint16_t dwell_time);
 
 
 /*-------------- PROGRAM BODY -------------*/
@@ -171,60 +239,45 @@ void setup()
 {
   Serial.begin(9600);
   initialise_robot();
-  Serial.print("\tFor single motor control enter 'motor'\n"
-               "\tFor cartesian position control enter 'cartesian'\n"
-               "\tTo reset the robot enter 'reset'\n");
+  current_coord = INITIAL_COORD; 
+  Serial.print("Commands:\n"
+               "\t'reset'     : Always use before turning the robot off.\n"
+               "\t'motor'     : Single motor control\n"
+               "\t'cartesian' : Cartesian effector control\n");
 }
 
 void loop()
 {
+  // Wait for user input
   uint32_t t0 = millis();
-  // Operate the robot until a user input is detected
   while (!Serial.available()) {
-    /* Runs only if delta is positive or equal to zero, practically
-     meaning that the acceleration is high enough so that the motor(s) 
-     can complete the entire distance within the time TF.
-     */  
-    if (is_delta_positive()) {
-      uint32_t t = millis() - t0;
-      if (single_motor_running) {
-        switch (motor_id) {
-          case 1: 
-            M1.write(compute_angle(&dynamics_M1, t));
-            break;
-          case 2:
-            M2.write(compute_angle(&dynamics_M2, t));
-            M2s.write(compute_angle(&dynamics_M2, t));
-            break;
-          case 3: 
-            M3.write(compute_angle(&dynamics_M3, t));
-            break;
-          case 4: 
-            M4.write(compute_angle(&dynamics_M4, t));
-            break;
-          case 5:
-            M5.write(compute_angle(&dynamics_M5, t));
-            break;
-          default:
-            break;
-        }
-      } 
-      else if (five_axis_running) {
-        M1.write(compute_angle(&dynamics_M1, t));
-        M2.write(compute_angle(&dynamics_M2, t));
-        M2s.write(compute_angle(&dynamics_M2, t));
-        M3.write(compute_angle(&dynamics_M3, t));
-        M4.write(compute_angle(&dynamics_M4, t));
-        M5.write(compute_angle(&dynamics_M5, t));
+    uint32_t t = millis() - t0;
+    if (single_motor_running) {
+      switch (motor_id) {
+        case 1: 
+          M1.write(compute_angle(&dynamics_M1, SMM_TRAJ_DUR, t));
+          break;
+        case 2:
+          M2.write(compute_angle(&dynamics_M2, SMM_TRAJ_DUR, t));
+          M2s.write(compute_angle(&dynamics_M2, SMM_TRAJ_DUR, t));
+          break;
+        case 3: 
+          M3.write(compute_angle(&dynamics_M3, SMM_TRAJ_DUR, t));
+          break;
+        case 4: 
+          M4.write(compute_angle(&dynamics_M4, SMM_TRAJ_DUR, t));
+          break;
+        case 5:
+          M5.write(compute_angle(&dynamics_M5, SMM_TRAJ_DUR, t));
+          break;
+        default:
+          break;
       }
     }
   }
-  /* An input has been detected, the robot is idle while the input
-   is being processed.
-   */
-  single_motor_running = false;
-  five_axis_running = false;
+
   // Get input
+  single_motor_running = false;
   char c = '\0', input[INPUT_SIZE + 1] = {0}; // Using +1 to account for the null indicator
   uint8_t i = 0;
 	while (i < INPUT_SIZE && (c = (char)Serial.read()) != '\n') {
@@ -250,9 +303,17 @@ void loop()
   else if (!strcmp(input, "reset")) {
     single_motor_mode = false;
     cartesian_mode = false;
-    if (reset_robot() == 0) {
-      Serial.print("Success: The robot has been reset.\n");
-    }
+    reset_robot();
+  }
+  else if (!strcmp(input, "square")) {
+    trajectory_t square[] = {
+      {.coord = {-70, 100, 250, 90, 90}, .avg_speed = LOW_SPEED},
+      {.coord = {-70, 100, 350, 90, 90}, .avg_speed = LOW_SPEED},
+      {.coord = {70, 100, 350, 90, 90},  .avg_speed = LOW_SPEED},
+      {.coord = {70, 100, 250, 90, 90},  .avg_speed = LOW_SPEED},
+      {.coord = {-70, 100, 250, 90, 90}, .avg_speed = LOW_SPEED},
+    };
+    follow_path(square, sizeof(square) / sizeof(square[0]), 1000);
   }
   // If input is not a mode, then it is a value
   else {
@@ -290,23 +351,23 @@ void loop()
       switch (motor_id) {
         case 1:
           dynamics_M1.angle_tf = map(percent, 0, 100, 0, RANGE_M1);
-          compute_dynamics(&dynamics_M1, M1.read());
+          compute_motor_dynamics(SMM_TRAJ_DUR, M1.read(), &dynamics_M1);
           break;
         case 2:
           dynamics_M2.angle_tf = map(percent, 0, 100, RANGE_M2, 0);
-          compute_dynamics(&dynamics_M2, M2.read());
+          compute_motor_dynamics(SMM_TRAJ_DUR, M2.read(), &dynamics_M2);
           break;
         case 3:
           dynamics_M3.angle_tf = map(percent, 0, 100, RANGE_M3, 0);
-          compute_dynamics(&dynamics_M3, M3.read());
+          compute_motor_dynamics(SMM_TRAJ_DUR, M3.read(), &dynamics_M3);
           break;
         case 4:
           dynamics_M4.angle_tf = map(percent, 0, 100, RANGE_M4, 0);
-          compute_dynamics(&dynamics_M4, M4.read());
+          compute_motor_dynamics(SMM_TRAJ_DUR, M4.read(), &dynamics_M4);
           break;
         case 5:
           dynamics_M5.angle_tf = map(percent, 0, 100, RANGE_M5, 0);
-          compute_dynamics(&dynamics_M5, M5.read());
+          compute_motor_dynamics(SMM_TRAJ_DUR, M5.read(), &dynamics_M5);
           break;
         default:
           Serial.print("Error: The given motor id does not exist.\n");
@@ -315,75 +376,31 @@ void loop()
       single_motor_running = true;
     }
     else if (cartesian_mode) {
-      // Format: X.Y.Z.YAW.PITCH
-      if (parse_cartesian_input(&cartesian_pos, input, INPUT_SIZE)) {
+      trajectory_t trajectory = {.avg_speed = LOW_SPEED};
+      if (parse_cartesian_input(input, INPUT_SIZE, &trajectory.coord)) {
         return;
       }
-      Serial.println("x: " + String(cartesian_pos.x));
-      Serial.println("y: " + String(cartesian_pos.y));
-      Serial.println("z: " + String(cartesian_pos.z));
-      Serial.println("yaw: " + String(cartesian_pos.yaw));
-      Serial.println("pitch: " + String(cartesian_pos.pitch));
-      // Compute dynamic parameters
-      get_angles_from_cartesian(&cartesian_pos);
-      compute_dynamics(&dynamics_M1, M1.read());
-      compute_dynamics(&dynamics_M2, M2.read());
-      compute_dynamics(&dynamics_M3, M3.read());
-      compute_dynamics(&dynamics_M4, M4.read());
-      compute_dynamics(&dynamics_M5, M5.read());
-      five_axis_running = true;
-      Serial.println("M1: " + String(dynamics_M1.angle_tf));
-      Serial.println("M2: " + String(dynamics_M2.angle_tf));
-      Serial.println("M3: " + String(dynamics_M3.angle_tf));
-      Serial.println("M4: " + String(dynamics_M4.angle_tf));
-      Serial.println("M5: " + String(dynamics_M5.angle_tf));
+      if (get_angles_from_cartesian(&trajectory.coord)) {
+        return;
+      }
+      if (compute_trajectory_duration(&trajectory)) {
+        return;
+      }
+      compute_motor_dynamics(trajectory.duration, M1.read(), &dynamics_M1);
+      compute_motor_dynamics(trajectory.duration, M2.read(), &dynamics_M2);
+      compute_motor_dynamics(trajectory.duration, M3.read(), &dynamics_M3);
+      compute_motor_dynamics(trajectory.duration, M4.read(), &dynamics_M4);
+      compute_motor_dynamics(trajectory.duration, M5.read(), &dynamics_M5);
+      run_robot(&trajectory);
     }
     else {
       Serial.print("Error: Unknown command.\n");
-    }
-
-    if (!is_delta_positive()) {
-      Serial.print("Error: Acceleration is too low. Please increase `ACC`.\n");
     }
   }
 }
 
 
 /*--------- FUNCTION DEFINITIONS ----------*/
-static uint8_t parse_cartesian_input(cartesian_position_t *pos, const char input[], const size_t len)
-{
-  if (pos == NULL) {
-    Serial.print("Error: (parse_cartesian_input) pos pointer is NULL.\n");
-    assert(pos);
-  }
-  char *buf = (char *)calloc(len, sizeof(char));
-  uint8_t coord_index = 0;
-  // Using +1 to account for the null indicator
-  for (size_t j = 0, i = 0; i < len + 1; i++) {
-    if (input[i] == '.' || input[i] == '\0') {
-      buf[j] = '\0';
-      // Assign, erase buffer and go to next coordinate
-      switch (coord_index) {
-        case 0: pos->x     = (int16_t)atoi(buf); break;
-        case 1: pos->y     = (int16_t)atoi(buf); break;
-        case 2: pos->z     = (int16_t)atoi(buf); break;
-        case 3: pos->yaw   = (int16_t)atoi(buf); break;
-        case 4: pos->pitch = (int16_t)atoi(buf); break;
-        default: break;
-      }
-      if (input[i] == '\0') break;
-      memset(buf, 0, len);
-      coord_index++;
-      j = 0;
-    }
-    else {
-        buf[j++] = input[i];
-    }
-  }
-  free(buf);
-  return 0;
-}
-
 static void initialise_robot(void)
 {
   M1.attach(PIN_M1, M1_PW_MIN, M1_PW_MAX);
@@ -392,7 +409,7 @@ static void initialise_robot(void)
   M3.attach(PIN_M3, M3_PW_MIN, M3_PW_MAX);
   M4.attach(PIN_M4, M4_PW_MIN, M4_PW_MAX);
   M5.attach(PIN_M5, M5_PW_MIN, M5_PW_MAX);
-
+  
   M1.write(ANGLE_INIT_M1);
   M2.write(ANGLE_INIT_M2);
   M2s.write(ANGLE_INIT_M2);
@@ -404,74 +421,147 @@ static void initialise_robot(void)
                "Success: The robot has been initialized.\n");
 }
 
-static void get_angles_from_cartesian(cartesian_position_t *pos)
+static uint8_t parse_cartesian_input(const char input[], const size_t len, cartesian_coord_t *coord)
 {
-  if (pos == NULL) {
-    Serial.print("Error: (get_angles_from_cartesian) pos pointer is NULL.\n");
-    assert(pos);
+  if (coord == NULL) {
+    Serial.print("Error: (parse_cartesian_input) coord pointer is NULL.\n");
+    assert(coord);
   }
-  // Get M5 coordinates
-  const float EFFECTOR_PROJ_XY = LENGTH_WRIST * sin(RAD(pos->pitch));
-  pos->x -= EFFECTOR_PROJ_XY * cos(RAD(pos->yaw));
-  pos->y -= EFFECTOR_PROJ_XY * sin(RAD(pos->yaw));
-  pos->z -= LENGTH_WRIST * cos(RAD(pos->pitch));
-  // Compute parameters
-  const float M2M5_XY = sqrt(pow(pos->x, 2) + pow(pos->y, 2));
-  const float M2M5 =  sqrt(pow(M2M5_XY, 2) + pow(pos->z - HEIGHT_SHOULDER, 2));
-  const float ALPHA_P = acos((pow(LENGTH_LA, 2) + pow(M2M5, 2) - pow(LENGTH_UA, 2)) / (2 * M2M5 * LENGTH_LA));
-  const float ALPHA = (3 * M_PI / 2) - asin((pos->z - HEIGHT_SHOULDER) / M2M5) - ALPHA_P;
-  const float BETA = acos((pow(LENGTH_LA, 2) + pow(LENGTH_UA, 2) - pow(M2M5, 2)) / (2 * LENGTH_LA * LENGTH_UA));
-  const float PHI = atan(float(pos->x) / float(pos->y));
-  const float EPSILON = ALPHA - acos(M3M4 / LENGTH_UA) - BETA;
-  const float V_X5 = cos(RAD(pos->yaw))*cos(PHI) - sin(RAD(pos->yaw))*sin(PHI);
-  const float V_Y5 = cos(EPSILON)*(cos(RAD(pos->yaw))*sin(PHI) + sin(RAD(pos->yaw))*cos(PHI)) - cos(RAD(pos->pitch))*sin(EPSILON);
-  const float V_Z5 = sin(EPSILON)*(cos(RAD(pos->yaw))*sin(PHI) + sin(RAD(pos->yaw))*cos(PHI)) + cos(RAD(pos->pitch))*cos(EPSILON);
-  // Compute joint angles
-  const uint8_t ANGLE_M1 = round(RANGE_M1 / 2 - DEG(PHI));
-  const uint8_t ANGLE_M2 = round(RANGE_M2 - INVR_TRANS_LA * (DEG(ALPHA) - ANGLE_INIT_LA));
-  const uint8_t ANGLE_M3 = round(PI_DEG - INVR_TRANS_UA * (DEG(BETA) - ANGLE_INIT_UA));
-  const uint8_t ANGLE_M4 = round(RANGE_M4 - DEG(atan(V_X5 / V_Z5)));
-  const uint8_t ANGLE_M5 = round(RANGE_M5 - DEG(atan(V_Y5 / sqrt(pow(V_X5, 2) + pow(V_Z5, 2)))) );
-  // If within the work enveloppe, assign the angles
-  if (ANGLE_M1 >= 0 && ANGLE_M1 <= RANGE_M1
-      && ANGLE_M2 >= 0 && ANGLE_M2 <= RANGE_M2
-      && ANGLE_M3 >= 0 && ANGLE_M3 <= RANGE_M3
-      && ANGLE_M4 >= 0 && ANGLE_M4 <= RANGE_M4
-      && ANGLE_M5 >= 0 && ANGLE_M5 <= RANGE_M5) {
-    dynamics_M1.angle_tf = ANGLE_M1;
-    dynamics_M2.angle_tf = ANGLE_M2;
-    dynamics_M3.angle_tf = ANGLE_M3;
-    dynamics_M4.angle_tf = ANGLE_M4;
-    dynamics_M5.angle_tf = ANGLE_M5;
+  char *buf = (char *)calloc(len, sizeof(char));
+  if (buf == NULL) {
+    Serial.print("Error: (parse_cartesian_input) Memory allocation failed.\n");
+    free(buf);
+    return 1;
   }
-  else {
-    Serial.print("Error: (get_angles_from_cartesian) Position is outside of work enveloppe.\n");
+  // Parse input (Using +1 to account for the null indicator)
+  uint8_t coord_index = 0;
+  for (size_t j = 0, i = 0; i < len + 1; i++) {
+    if (input[i] == '.' || input[i] == '\0') {
+      buf[j] = '\0';
+      // Assign, erase buffer and go to next coordinate
+      switch (coord_index++) {
+        case 0: coord->x     = (int16_t)atoi(buf); break;
+        case 1: coord->y     = (int16_t)atoi(buf); break;
+        case 2: coord->z     = (int16_t)atoi(buf); break;
+        case 3: coord->yaw   = (int16_t)atoi(buf); break;
+        case 4: coord->pitch = (int16_t)atoi(buf); break;
+        default: break;
+      }
+      if (input[i] == '\0') break;
+      memset(buf, 0, len);
+      j = 0;
+    }
+    else {
+        buf[j++] = input[i];
+    }
   }
+  free(buf);
+  return 0;
 }
 
-static void compute_dynamics(motor_dynamics_t *dyn, const uint8_t current_angle)
+static uint8_t get_angles_from_cartesian(const cartesian_coord_t *coord)
+{
+  if (coord == NULL) {
+    Serial.print("Error: (get_angles_from_cartesian) coord pointer is NULL.\n");
+    assert(coord);
+  }
+  // Get M5 coordinates
+  const float EFFECTOR_PROJ_XY = LENGTH_WRIST * sin(RAD(coord->pitch));
+  const float M5_x = coord->x - EFFECTOR_PROJ_XY * cos(RAD(coord->yaw));
+  const float M5_y = coord->y - EFFECTOR_PROJ_XY * sin(RAD(coord->yaw));
+  const float M5_z = coord->z - LENGTH_WRIST * cos(RAD(coord->pitch));
+  // Compute parameters
+  const float M2M5_XY = sqrt(pow(M5_x, 2) + pow(M5_y, 2));
+  const float M2M5 =  sqrt(pow(M2M5_XY, 2) + pow(M5_z - HEIGHT_SHOULDER, 2));
+  const float ALPHA_P = acos((pow(LENGTH_LA, 2) + pow(M2M5, 2) - pow(LENGTH_UA, 2)) / (2 * M2M5 * LENGTH_LA));
+  const float ALPHA = (float)(3.0 * M_PI / 2.0) - asin((M5_z - HEIGHT_SHOULDER) / M2M5) - ALPHA_P;
+  const float BETA = acos((pow(LENGTH_LA, 2) + pow(LENGTH_UA, 2) - pow(M2M5, 2)) / (2 * LENGTH_LA * LENGTH_UA));
+  const float PHI = atan(float(M5_x) / float(M5_y));
+  const float EPSILON = ALPHA - acos(M3M4 / LENGTH_UA) - BETA;
+  const double V_X5 = cos(RAD(coord->yaw))*cos(PHI) - sin(RAD(coord->yaw))*sin(PHI);
+  const double V_Y5 = cos(EPSILON)*(cos(RAD(coord->yaw))*sin(PHI) + sin(RAD(coord->yaw))*cos(PHI)) - cos(RAD(coord->pitch))*sin(EPSILON);
+  const double V_Z5 = sin(EPSILON)*(cos(RAD(coord->yaw))*sin(PHI) + sin(RAD(coord->yaw))*cos(PHI)) + cos(RAD(coord->pitch))*cos(EPSILON);
+  // Compute joint angles
+  const int16_t ANGLE_M1 = round(PI2_DEG + DEG(PHI));
+  const int16_t ANGLE_M2 = round(PI_DEG - INVR_TRANS_LA * (DEG(ALPHA) - ANGLE_INIT_LA));
+  const int16_t ANGLE_M3 = round(PI_DEG - INVR_TRANS_UA * (DEG(BETA) - ANGLE_INIT_UA));
+  const int16_t ANGLE_M4 = round(PI2_DEG - DEG(atan(V_X5 / V_Z5)));
+  const int16_t ANGLE_M5 = (V_Z5 >= 0.0) ? PI_DEG - DEG(atan(V_Y5 / sqrt(pow(V_X5, 2) + pow(V_Z5, 2)))) :
+                                           DEG(atan(V_Y5 / sqrt(pow(V_X5, 2) + pow(V_Z5, 2))));                                  
+  // Check if the position can be reached
+  if (ANGLE_M1 < 0 || ANGLE_M1 > RANGE_M1
+      || ANGLE_M2 < 0 || ANGLE_M2 > RANGE_M2
+      || ANGLE_M3 < 0 || ANGLE_M3 > RANGE_M3
+      || ANGLE_M4 < 0 || ANGLE_M4 > RANGE_M4
+      || ANGLE_M5 < 0 || ANGLE_M5 > RANGE_M5) {
+    Serial.print("Error: (get_angles_from_cartesian) Position cannot be reached, due to...\n");
+    if (ANGLE_M1 < 0 || ANGLE_M1 > RANGE_M1) Serial.print("Error: M1 = " + String(ANGLE_M1) + "°\n");
+    if (ANGLE_M2 < 0 || ANGLE_M2 > RANGE_M2) Serial.print("Error: M2 = " + String(ANGLE_M2) + "°\n");
+    if (ANGLE_M3 < 0 || ANGLE_M3 > RANGE_M3) Serial.print("Error: M3 = " + String(ANGLE_M3) + "°\n");
+    if (ANGLE_M4 < 0 || ANGLE_M4 > RANGE_M4) Serial.print("Error: M4 = " + String(ANGLE_M4) + "°\n");
+    if (ANGLE_M5 < 0 || ANGLE_M5 > RANGE_M5) Serial.print("Error: M5 = " + String(ANGLE_M5) + "°\n");
+    return 1;
+  }
+  dynamics_M1.angle_tf = ANGLE_M1;
+  dynamics_M2.angle_tf = ANGLE_M2;
+  dynamics_M3.angle_tf = ANGLE_M3;
+  dynamics_M4.angle_tf = ANGLE_M4;
+  dynamics_M5.angle_tf = ANGLE_M5;
+  return 0;
+}
+
+static uint8_t compute_trajectory_duration(trajectory_t *traj)
+{
+  if (traj == NULL) {
+    Serial.print("Error: (compute_trajectory_duration) traj pointer is NULL.\n");
+    assert(traj);
+  }
+  if (traj->avg_speed != LOW_SPEED && traj->avg_speed != HIGH_SPEED) {
+    Serial.print("Error: (compute_trajectory_duration) Speed value is incorrect."
+                                                      "Choose either LOW_SPEED or HIGH_SPEED.\n");
+    return 1;
+  }
+  // Compute distance to cover (mm)
+  const float EFFECTOR_PROJ_XY_CUR = LENGTH_WRIST * sin(RAD(current_coord.pitch));
+  const float EFFECTOR_PROJ_XY_NEW = LENGTH_WRIST * sin(RAD(traj->coord.pitch));
+
+  const int16_t M5_X_CUR = current_coord.x - EFFECTOR_PROJ_XY_CUR * cos(RAD(current_coord.yaw));
+  const int16_t M5_Y_CUR = current_coord.y - EFFECTOR_PROJ_XY_CUR * sin(RAD(current_coord.yaw));
+  const int16_t M5_Z_CUR = current_coord.z - LENGTH_WRIST * cos(RAD(current_coord.pitch));
+
+  const int16_t M5_X_NEW = traj->coord.x - EFFECTOR_PROJ_XY_NEW * cos(RAD(traj->coord.yaw));
+  const int16_t M5_Y_NEW = traj->coord.y - EFFECTOR_PROJ_XY_NEW * sin(RAD(traj->coord.yaw));
+  const int16_t M5_Z_NEW = traj->coord.z - LENGTH_WRIST * cos(RAD(traj->coord.pitch));
+
+  const int16_t DIST_X = M5_X_NEW - M5_X_CUR;
+  const int16_t DIST_Y = M5_Y_NEW - M5_Y_CUR;
+  const int16_t DIST_Z = M5_Z_NEW - M5_Z_CUR;
+  const uint16_t DIST = sqrt(pow(DIST_X, 2) + pow(DIST_Y, 2) + pow(DIST_Z, 2));
+  // Compute the duration of the displacement (ms)
+  traj->duration = (1000 * DIST) / traj->avg_speed;
+  return 0;
+}
+
+static void compute_motor_dynamics(const int duration, const int current_angle, motor_dynamics_t *dyn)
 {
   if (dyn == NULL) {
-    Serial.print("Error: (compute_dynamics) dyn pointer is NULL.\n");
+    Serial.print("Error: (compute_motor_dynamics) dyn pointer is NULL.\n");
     assert(dyn);
   }
   dyn->angle_t0 = current_angle;
-  if (dyn->angle_t0 < dyn->angle_tf) dyn->forward = 1;
-  else dyn->forward = 0;
+  dyn->angle_t0 < dyn->angle_tf ? dyn->forward = 1 : dyn->forward = 0;
 
-  const byte DISTANCE = sqrt(pow(dyn->angle_tf - dyn->angle_t0, 2));
-  dyn->delta = pow(TF * ACC / 1000.0, 2) - 4 * DISTANCE * ACC;
+  // Compute the minimal acceleration (we want the movements to be as smooth as possible)
+  const uint8_t ANGULAR_DISTANCE = abs(dyn->angle_tf - dyn->angle_t0);
+  const float MAX_SPEED = 2 * (float)ANGULAR_DISTANCE / ((float)duration / 1000.0);
+  dyn->acc = (float)(2 * MAX_SPEED) / (float)(duration / 1000.0);
+  dyn->t1 = (1000 * MAX_SPEED) / dyn->acc;   // ms
 
-  const int SPEED = 0.5 * (TF * ACC / 1000.0 - pow(dyn->delta, 0.5));
-  dyn->t1 = 1000 * SPEED / ACC;     // ms
-  dyn->t2 = TF - dyn->t1;           // ms
-
-  const int SIGN = (dyn->angle_tf - dyn->angle_t0) / DISTANCE;
-  dyn->angle_t1 = dyn->angle_t0 + SIGN * ACC * pow(dyn->t1 / 1000.0, 2) / 2;
-  dyn->angle_t2 = dyn->angle_t1 + SIGN * SPEED * (dyn->t2 - dyn->t1) / 1000.0;
+  const int8_t SIGN = (dyn->angle_tf - dyn->angle_t0) / ANGULAR_DISTANCE;
+  dyn->angle_t1 = dyn->angle_t0 + SIGN * dyn->acc * pow(dyn->t1 / 1000.0, 2) / 2;
 }
 
-static uint8_t compute_angle(const motor_dynamics_t *dyn, const int64_t t)
+static uint8_t compute_angle(const motor_dynamics_t *dyn, const int duration, const int64_t t)
 {
   if (dyn == NULL) {
     Serial.print("Error: (compute_angle) dyn pointer is NULL.\n");
@@ -479,16 +569,12 @@ static uint8_t compute_angle(const motor_dynamics_t *dyn, const int64_t t)
   }
   uint8_t angle;
   if (t <= dyn->t1) {
-    angle = dyn->forward ? (pow(t / 1000.0, 2) * ACC / 2 + dyn->angle_t0) :
-                           (-pow(t / 1000.0, 2) * ACC / 2 + dyn->angle_t0);
+    angle = dyn->forward ? (pow(t / 1000.0, 2) * dyn->acc / 2 + dyn->angle_t0) :
+                           (-pow(t / 1000.0, 2) * dyn->acc / 2 + dyn->angle_t0);
   }
-  else if (t > dyn->t1 && t <= dyn->t2) {
-    const int B = dyn->angle_t1 - (dyn->angle_t2 - dyn->angle_t1) * dyn->t1 / (dyn->t2 - dyn->t1);
-    angle = t * (dyn->angle_t2 - dyn->angle_t1) / (dyn->t2 - dyn->t1) + B;
-  }
-  else if (t > dyn->t2 && t <= TF) {
-    angle = dyn->forward ? (-pow((TF - t) / 1000.0, 2) * ACC / 2 + dyn->angle_tf) :
-                           (pow((t - TF) / 1000.0, 2) * ACC / 2 + dyn->angle_tf);
+  else if (t <= duration) {
+    angle = dyn->forward ? (-pow((duration - t) / 1000.0, 2) * dyn->acc / 2 + dyn->angle_tf) :
+                           (pow((t - duration) / 1000.0, 2) * dyn->acc / 2 + dyn->angle_tf);
   }
   else {
     angle = dyn->angle_tf;
@@ -496,48 +582,63 @@ static uint8_t compute_angle(const motor_dynamics_t *dyn, const int64_t t)
   return angle;
 }
 
-static uint8_t reset_robot(void)
+static void run_robot(const trajectory_t *traj)
 {
-  // Compute dynamic parameters
+  if (traj == NULL) {
+    Serial.print("Error: (run_robot) traj pointer is NULL.\n");
+    assert(traj);
+  }
+  int64_t t = 0, t0 = millis();
+  while (t < traj->duration) {
+    t = millis() - t0;
+    M1.write(compute_angle(&dynamics_M1, traj->duration, t));
+    M2.write(compute_angle(&dynamics_M2, traj->duration, t));
+    M2s.write(compute_angle(&dynamics_M2, traj->duration, t));
+    M3.write(compute_angle(&dynamics_M3, traj->duration, t));
+    M4.write(compute_angle(&dynamics_M4, traj->duration, t));
+    M5.write(compute_angle(&dynamics_M5, traj->duration, t));
+  }
+  current_coord = traj->coord;
+}
+
+static void reset_robot(void)
+{
+  trajectory_t trajectory = {
+    .coord = INITIAL_COORD,
+    .avg_speed = LOW_SPEED,
+    .duration = SMM_TRAJ_DUR
+  };
   dynamics_M1.angle_tf = ANGLE_INIT_M1;
   dynamics_M2.angle_tf = ANGLE_INIT_M2;
   dynamics_M3.angle_tf = ANGLE_INIT_M3;
   dynamics_M4.angle_tf = ANGLE_INIT_M4;
   dynamics_M5.angle_tf = ANGLE_INIT_M5;
-  compute_dynamics(&dynamics_M1, M1.read());
-  compute_dynamics(&dynamics_M2, M2.read());
-  compute_dynamics(&dynamics_M3, M3.read());
-  compute_dynamics(&dynamics_M4, M4.read());
-  compute_dynamics(&dynamics_M5, M5.read());
-  // Check if dynamics parameters are valid
-  if (!is_delta_positive()) {
-    Serial.print("Error: (reset_robot) Acceleration is too low. Please increase `ACC`.\n");
-    return 1;
-  }
-  // Run the motors
-  long t = 0;
-  long t0 = millis();
-  do {
-    t = millis() - t0;
-    M1.write(compute_angle(&dynamics_M1, t));
-    M2.write(compute_angle(&dynamics_M2, t));
-    M2s.write(compute_angle(&dynamics_M2, t));
-    M3.write(compute_angle(&dynamics_M3, t));
-    M4.write(compute_angle(&dynamics_M4, t));
-    M5.write(compute_angle(&dynamics_M5, t));
-  } while (t < TF);
+  compute_motor_dynamics(trajectory.duration, M1.read(), &dynamics_M1);
+  compute_motor_dynamics(trajectory.duration, M2.read(), &dynamics_M2);
+  compute_motor_dynamics(trajectory.duration, M3.read(), &dynamics_M3);
+  compute_motor_dynamics(trajectory.duration, M4.read(), &dynamics_M4);
+  compute_motor_dynamics(trajectory.duration, M5.read(), &dynamics_M5);
 
-  return 0;
+  run_robot(&trajectory);
+  Serial.print("Success: The robot has been reset.\n");
 }
 
-static uint8_t is_delta_positive(void)
+static void follow_path(trajectory_t path[], const uint32_t npoints, const uint16_t dwell_time)
 {
-  if (dynamics_M1.delta >= 0
-      && dynamics_M2.delta >= 0
-      && dynamics_M3.delta >= 0
-      && dynamics_M4.delta >= 0
-      && dynamics_M5.delta >= 0) {
-      return 1;
+  for (uint8_t i = 0; i < npoints; i++) {
+    // Get angles
+    if (get_angles_from_cartesian(&path[i].coord)) {
+      return;
+    }
+    // Compute parameters
+    compute_trajectory_duration(&path[i]);
+    compute_motor_dynamics(path[i].duration, M1.read(), &dynamics_M1);
+    compute_motor_dynamics(path[i].duration, M2.read(), &dynamics_M2);
+    compute_motor_dynamics(path[i].duration, M3.read(), &dynamics_M3);
+    compute_motor_dynamics(path[i].duration, M4.read(), &dynamics_M4);
+    compute_motor_dynamics(path[i].duration, M5.read(), &dynamics_M5);
+
+    run_robot(&path[i]);
+    delay(dwell_time);
   }
-  return 0;
 }
