@@ -115,6 +115,17 @@ typedef struct {
 
 
 /*----------- GLOBAL VARIABLES ------------*/
+
+static enum {
+  NONE,
+  SINGLE_MOTOR_MODE,
+  CARTESIAN_MODE,
+  SEQUENCE_MODE,
+} state = NONE;
+
+uint8_t running = 0;
+uint8_t motor_id = 0;
+
 Servo M1;
 Servo M2;
 Servo M2s;
@@ -133,7 +144,6 @@ motor_dynamics_t dynamics_M5;
  */
 #define INITIAL_COORD   {.x = 10, .y = 0, .z = 282, .yaw = 0, .pitch = 0}
 cartesian_coord_t current_coord;
-
 trajectory_t cartesian_traj = {.avg_speed = LOW_SPEED};
 trajectory_t square[] = {
   {.coord = {-70, 100, 250, 90, 90}, .avg_speed = LOW_SPEED},
@@ -142,12 +152,6 @@ trajectory_t square[] = {
   {.coord = {70, 100, 250, 90, 90},  .avg_speed = LOW_SPEED},
   {.coord = {-70, 100, 250, 90, 90}, .avg_speed = LOW_SPEED},
 };
-
-uint8_t motor_id          = 0;
-bool single_motor_mode    = false;
-bool cartesian_mode       = false;
-bool sequence_mode        = false;
-bool running              = false;
 
 
 /*---------- FUNCTION PROTOTYPES ----------*/
@@ -267,56 +271,66 @@ void loop()
   int64_t t0 = millis();
   while (!Serial.available()) {
     int64_t t = millis() - t0;
-    if (single_motor_mode && running) {
-      switch (motor_id) {
-        case 1: 
-          M1.write(compute_angle(&dynamics_M1, SMM_TRAJ_DUR, t));
+
+    switch (state) {
+      case SINGLE_MOTOR_MODE:
+        if (!running || t > SMM_TRAJ_DUR) {
+          running = 0;
           break;
-        case 2:
-          M2.write(compute_angle(&dynamics_M2, SMM_TRAJ_DUR, t));
-          M2s.write(compute_angle(&dynamics_M2, SMM_TRAJ_DUR, t));
-          break;
-        case 3: 
-          M3.write(compute_angle(&dynamics_M3, SMM_TRAJ_DUR, t));
-          break;
-        case 4: 
-          M4.write(compute_angle(&dynamics_M4, SMM_TRAJ_DUR, t));
-          break;
-        case 5:
-          M5.write(compute_angle(&dynamics_M5, SMM_TRAJ_DUR, t));
-          break;
-        default:
-          break;
-      }
-      if (t > SMM_TRAJ_DUR) {
-        running = false;
-      }
-    }
-    else if (cartesian_mode && running) {
-      if (update_robot_position(cartesian_traj.duration, t)) {
-        running = false;
-        current_coord = cartesian_traj.coord;
-      }
-    }
-    else if (sequence_mode && running) {
-      int8_t err = follow_path(square, sizeof(square) / sizeof(square[0]), 1000);
-      if (err == - 1) {
-        Serial.print("Warning: The robot is going to reset automatically in 5 seconds...\n");
-        for (int8_t j = 5; j > 0; j--) {
-          delay(1000);
-          Serial.print("..." + String(j - 1) + '\n');
         }
-        reset_robot();
-        running = false;
-      }
-      else if (err == 1) {
-        running = false;
-      }
+        switch (motor_id) {
+          case 1: 
+            M1.write(compute_angle(&dynamics_M1, SMM_TRAJ_DUR, t));
+            break;
+          case 2:
+            M2.write(compute_angle(&dynamics_M2, SMM_TRAJ_DUR, t));
+            M2s.write(compute_angle(&dynamics_M2, SMM_TRAJ_DUR, t));
+            break;
+          case 3: 
+            M3.write(compute_angle(&dynamics_M3, SMM_TRAJ_DUR, t));
+            break;
+          case 4: 
+            M4.write(compute_angle(&dynamics_M4, SMM_TRAJ_DUR, t));
+            break;
+          case 5:
+            M5.write(compute_angle(&dynamics_M5, SMM_TRAJ_DUR, t));
+            break;
+          default:
+            break;
+        }
+        break;
+
+      case CARTESIAN_MODE:
+        if (!running) break;
+        else if (update_robot_position(cartesian_traj.duration, t)) {
+          running = 0;
+          current_coord = cartesian_traj.coord;
+        }
+        break;
+
+      case SEQUENCE_MODE: {
+        int8_t err = follow_path(square, sizeof(square) / sizeof(square[0]), 1000);
+        if (err == - 1) {
+          Serial.print("Warning: The robot is going to reset automatically in 5 seconds...\n");
+          for (int8_t j = 5; j > 0; j--) {
+            delay(1000);
+            Serial.print("..." + String(j - 1) + '\n');
+          }
+          reset_robot();
+          state = NONE;
+        }
+        else if (err == 1) {
+          state = NONE;
+        }
+      } break;
+
+      default:
+        break;
     }
   }
 
   // Get input
-  running = false;
+  running = 0;
   char c = '\0', input[INPUT_SIZE + 1] = {0}; // Using +1 to account for the null indicator
   uint8_t i = 0;
 	while (i < INPUT_SIZE && (c = (char)Serial.read()) != '\n') {
@@ -330,102 +344,101 @@ void loop()
 
   // Parse input
   if (!strcmp(input, "motor")) {
-    single_motor_mode = true;
-    cartesian_mode = false;
+    state = SINGLE_MOTOR_MODE;
     Serial.print("Success: 'Single motor mode' accessed. Format: ID.VALUE\n");
   }
   else if (!strcmp(input, "cartesian")) {
-    single_motor_mode = false;
-    cartesian_mode = true;
+    state = CARTESIAN_MODE;
     Serial.print("Success: 'Cartesian mode' accessed. Format: X.Y.Z.YAW.PITCH\n");
   }
   else if (!strcmp(input, "reset")) {
-    single_motor_mode = false;
-    cartesian_mode = false;
+    state = NONE;
     reset_robot();
   }
   else if (!strcmp(input, "sequence")) {
-    sequence_mode = true;
-    running = true;
+    state = SEQUENCE_MODE;
   }
   else { // If input is not a mode, then it may be a value
-    if (single_motor_mode) {
-      /* The number (ID as in Servo M<ID>) of the motor must be entered as 
-        well as the desired position to reach, expressed in percentage of the  
-        total allowed displacement of the given motor.
+    switch (state) {
+      case SINGLE_MOTOR_MODE: {
+        /* The number (ID as in Servo M<ID>) of the motor must be entered as 
+          well as the desired position to reach, expressed in percentage of the  
+          total allowed displacement of the given motor.
 
-        Exemples: 
-        "M1.050" will move the motor M1 to its middle position, hence 90°.
-        "M3.100" will move the motor M3 to its maximum position, here 0°. This 
-        is due to how the motor is positionned in the robot, thus the use of %
-        instead of angles. Conversion is made below.
-        */
-      if (!isdigit(input[0])) {
-        Serial.print("Error: The given motor id is invalid. Please use digits only.\n");
-        return;
-      }
-      motor_id = (int)(input[0] - '0');
-      char *buffer = (char *)calloc(len, sizeof(char));
-      uint8_t start_read_value = 0;
-      for (uint8_t i = 0; i < len; i++) {
-        if (input[i] == '.') {
-          start_read_value = i + 1;
+          Exemples: 
+          "M1.050" will move the motor M1 to its middle position, hence 90°.
+          "M3.100" will move the motor M3 to its maximum position, here 0°. This 
+          is due to how the motor is positionned in the robot, thus the use of %
+          instead of angles. Conversion is made below.
+          */
+        if (!isdigit(input[0])) {
+          Serial.print("Error: The given motor id is invalid. Please use digits only.\n");
+          return;
         }
-        else if (start_read_value) {
-          buffer[i - start_read_value] = input[i];
+        motor_id = (int)(input[0] - '0');
+        char *buffer = (char *)calloc(len, sizeof(char));
+        uint8_t start_read_value = 0;
+        for (uint8_t i = 0; i < len; i++) {
+          if (input[i] == '.') {
+            start_read_value = i + 1;
+          }
+          else if (start_read_value) {
+            buffer[i - start_read_value] = input[i];
+          }
         }
-      }
-      buffer[len - start_read_value] = '\0';
-      int percent = atoi(buffer);
-      free(buffer);
-      // Compute dynamics parameters
-      switch (motor_id) {
-        case 1:
-          dynamics_M1.angle_tf = map(percent, 0, 100, 0, RANGE_M1);
-          compute_motor_dynamics(SMM_TRAJ_DUR, M1.read(), &dynamics_M1);
-          break;
-        case 2:
-          dynamics_M2.angle_tf = map(percent, 0, 100, RANGE_M2, 0);
-          compute_motor_dynamics(SMM_TRAJ_DUR, M2.read(), &dynamics_M2);
-          break;
-        case 3:
-          dynamics_M3.angle_tf = map(percent, 0, 100, RANGE_M3, 0);
-          compute_motor_dynamics(SMM_TRAJ_DUR, M3.read(), &dynamics_M3);
-          break;
-        case 4:
-          dynamics_M4.angle_tf = map(percent, 0, 100, RANGE_M4, 0);
-          compute_motor_dynamics(SMM_TRAJ_DUR, M4.read(), &dynamics_M4);
-          break;
-        case 5:
-          dynamics_M5.angle_tf = map(percent, 0, 100, RANGE_M5, 0);
-          compute_motor_dynamics(SMM_TRAJ_DUR, M5.read(), &dynamics_M5);
-          break;
-        default:
-          Serial.print("Error: The given motor id does not exist.\n");
-          break;
-      }
-      running = true;
-    }
-    else if (cartesian_mode) {
-      cartesian_traj.coord = {0};
-      if (parse_cartesian_input(input, INPUT_SIZE, &cartesian_traj.coord)) {
-        return;
-      }
-      if (get_angles_from_cartesian(&cartesian_traj.coord)) {
-        return;
-      }
-      if (compute_trajectory_duration(&cartesian_traj)) {
-        return;
-      }
-      compute_motor_dynamics(cartesian_traj.duration, M1.read(), &dynamics_M1);
-      compute_motor_dynamics(cartesian_traj.duration, M2.read(), &dynamics_M2);
-      compute_motor_dynamics(cartesian_traj.duration, M3.read(), &dynamics_M3);
-      compute_motor_dynamics(cartesian_traj.duration, M4.read(), &dynamics_M4);
-      compute_motor_dynamics(cartesian_traj.duration, M5.read(), &dynamics_M5);
-      running = true;
-    }
-    else {
-      Serial.print("Error: Unknown command.\n");
+        buffer[len - start_read_value] = '\0';
+        int percent = atoi(buffer);
+        free(buffer);
+        // Compute dynamics parameters
+        switch (motor_id) {
+          case 1:
+            dynamics_M1.angle_tf = map(percent, 0, 100, 0, RANGE_M1);
+            compute_motor_dynamics(SMM_TRAJ_DUR, M1.read(), &dynamics_M1);
+            break;
+          case 2:
+            dynamics_M2.angle_tf = map(percent, 0, 100, RANGE_M2, 0);
+            compute_motor_dynamics(SMM_TRAJ_DUR, M2.read(), &dynamics_M2);
+            break;
+          case 3:
+            dynamics_M3.angle_tf = map(percent, 0, 100, RANGE_M3, 0);
+            compute_motor_dynamics(SMM_TRAJ_DUR, M3.read(), &dynamics_M3);
+            break;
+          case 4:
+            dynamics_M4.angle_tf = map(percent, 0, 100, RANGE_M4, 0);
+            compute_motor_dynamics(SMM_TRAJ_DUR, M4.read(), &dynamics_M4);
+            break;
+          case 5:
+            dynamics_M5.angle_tf = map(percent, 0, 100, RANGE_M5, 0);
+            compute_motor_dynamics(SMM_TRAJ_DUR, M5.read(), &dynamics_M5);
+            break;
+          default:
+            Serial.print("Error: The given motor id does not exist.\n");
+            break;
+        }
+        running = 1;
+      } break;
+
+      case CARTESIAN_MODE: {
+        cartesian_traj.coord = {0};
+        if (parse_cartesian_input(input, INPUT_SIZE, &cartesian_traj.coord)) {
+          return;
+        }
+        if (get_angles_from_cartesian(&cartesian_traj.coord)) {
+          return;
+        }
+        if (compute_trajectory_duration(&cartesian_traj)) {
+          return;
+        }
+        compute_motor_dynamics(cartesian_traj.duration, M1.read(), &dynamics_M1);
+        compute_motor_dynamics(cartesian_traj.duration, M2.read(), &dynamics_M2);
+        compute_motor_dynamics(cartesian_traj.duration, M3.read(), &dynamics_M3);
+        compute_motor_dynamics(cartesian_traj.duration, M4.read(), &dynamics_M4);
+        compute_motor_dynamics(cartesian_traj.duration, M5.read(), &dynamics_M5);
+        running = 1;
+      } break;
+      default:
+        Serial.print("Error: Unknown command.\n");
+        break;
     }
   }
 }
